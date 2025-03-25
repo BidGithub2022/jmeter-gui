@@ -1,0 +1,119 @@
+# ─────────────── Stage 1: Fedora Build Layer ───────────────
+FROM fedora:39 AS builder
+
+ENV JMETER_VERSION=5.5
+ENV JMETER_HOME=/opt/apache-jmeter-${JMETER_VERSION}
+
+RUN dnf -y upgrade --refresh && \
+    dnf -y install \
+    java-17-openjdk java-17-openjdk-devel \
+    xorg-x11-server-Xvfb \
+    x11vnc \
+    fluxbox \
+    xterm \
+    net-tools \
+    procps-ng \
+    python3-pip \
+    supervisor \
+    wget curl unzip tar gzip sudo findutils which && \
+    dnf clean all
+
+# Install JMeter
+RUN wget https://archive.apache.org/dist/jmeter/binaries/apache-jmeter-${JMETER_VERSION}.tgz -O /tmp/jmeter.tgz && \
+    mkdir -p /opt && \
+    tar -xzf /tmp/jmeter.tgz -C /opt && \
+    rm /tmp/jmeter.tgz
+
+# Install noVNC
+RUN mkdir -p /opt/novnc && \
+    curl -L -o /tmp/novnc.tar.gz https://github.com/novnc/noVNC/archive/v1.3.0.tar.gz && \
+    tar -xzf /tmp/novnc.tar.gz --strip-components=1 -C /opt/novnc && \
+    curl -L -o /tmp/websockify.tar.gz https://github.com/novnc/websockify/archive/v0.10.0.tar.gz && \
+    mkdir -p /opt/novnc/utils/websockify && \
+    tar -xzf /tmp/websockify.tar.gz --strip-components=1 -C /opt/novnc/utils/websockify
+
+# Create autostart script for fluxbox
+RUN mkdir -p /home/jmeter/.fluxbox && \
+    echo '#!/bin/bash' > /home/jmeter/.fluxbox/startup && \
+    echo 'jmeter &' >> /home/jmeter/.fluxbox/startup && \
+    echo 'exec fluxbox' >> /home/jmeter/.fluxbox/startup && \
+    chmod +x /home/jmeter/.fluxbox/startup
+
+
+# ─────────────── Stage 2: UBI9 Runtime ───────────────
+FROM registry.access.redhat.com/ubi9/ubi:latest
+
+ENV JMETER_VERSION=5.5
+ENV JMETER_HOME=/opt/apache-jmeter-${JMETER_VERSION}
+ENV PATH=$JMETER_HOME/bin:/usr/local/bin:/usr/bin:$PATH
+ENV DISPLAY=:1
+ENV HOME=/home/jmeter
+
+# Install runtime dependencies only
+RUN dnf -y install \
+    java-17-openjdk \
+    python3-pip \
+    sudo && \
+    dnf clean all
+
+# Create jmeter user
+RUN useradd -ms /bin/bash jmeter && \
+    echo "jmeter ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+# Create required dirs
+RUN mkdir -p /home/jmeter/logs /home/jmeter/run /etc/supervisord.d /opt
+
+# Copy binaries and configs from Fedora builder
+COPY --from=builder /usr/bin/Xvfb /usr/bin/
+COPY --from=builder /usr/bin/x11vnc /usr/bin/
+COPY --from=builder /usr/bin/fluxbox /usr/bin/
+COPY --from=builder /usr/bin/xterm /usr/bin/
+COPY --from=builder /usr/bin/supervisord /usr/bin/
+COPY --from=builder /opt/apache-jmeter-${JMETER_VERSION} /opt/apache-jmeter-${JMETER_VERSION}
+COPY --from=builder /opt/novnc /opt/novnc
+COPY --from=builder /home/jmeter/.fluxbox /home/jmeter/.fluxbox
+
+# Supervisor config
+RUN echo "[unix_http_server]" > /etc/supervisord.d/supervisord.conf && \
+    echo "file=/home/jmeter/run/supervisor.sock" >> /etc/supervisord.d/supervisord.conf && \
+    echo "chmod=0700" >> /etc/supervisord.d/supervisord.conf && \
+    echo "" >> /etc/supervisord.d/supervisord.conf && \
+    echo "[supervisord]" >> /etc/supervisord.d/supervisord.conf && \
+    echo "logfile=/home/jmeter/logs/supervisord.log" >> /etc/supervisord.d/supervisord.conf && \
+    echo "pidfile=/home/jmeter/run/supervisord.pid" >> /etc/supervisord.d/supervisord.conf && \
+    echo "nodaemon=true" >> /etc/supervisord.d/supervisord.conf && \
+    echo "" >> /etc/supervisord.d/supervisord.conf && \
+    echo "[rpcinterface:supervisor]" >> /etc/supervisord.d/supervisord.conf && \
+    echo "supervisor.rpcinterface_factory = supervisor.rpcinterface:make_main_rpcinterface" >> /etc/supervisord.d/supervisord.conf && \
+    echo "" >> /etc/supervisord.d/supervisord.conf && \
+    echo "[supervisorctl]" >> /etc/supervisord.d/supervisord.conf && \
+    echo "serverurl=unix:///home/jmeter/run/supervisor.sock" >> /etc/supervisord.d/supervisord.conf && \
+    echo "" >> /etc/supervisord.d/supervisord.conf && \
+    echo "[program:xvfb]" >> /etc/supervisord.d/supervisord.conf && \
+    echo "command=/usr/bin/Xvfb :1 -screen 0 1920x1080x24" >> /etc/supervisord.d/supervisord.conf && \
+    echo "autorestart=true" >> /etc/supervisord.d/supervisord.conf && \
+    echo "[program:x11vnc]" >> /etc/supervisord.d/supervisord.conf && \
+    echo "command=/usr/bin/x11vnc -display :1 -nopw -forever -shared -rfbport 5901 -listen 0.0.0.0" >> /etc/supervisord.d/supervisord.conf && \
+    echo "autorestart=true" >> /etc/supervisord.d/supervisord.conf && \
+    echo "[program:fluxbox]" >> /etc/supervisord.d/supervisord.conf && \
+    echo "command=/usr/bin/fluxbox" >> /etc/supervisord.d/supervisord.conf && \
+    echo "environment=DISPLAY=:1" >> /etc/supervisord.d/supervisord.conf && \
+    echo "autorestart=true" >> /etc/supervisord.d/supervisord.conf && \
+    echo "[program:novnc]" >> /etc/supervisord.d/supervisord.conf && \
+    echo "command=/opt/novnc/utils/novnc_proxy --vnc 0.0.0.0:5901 --listen 0.0.0.0:6080" >> /etc/supervisord.d/supervisord.conf && \
+    echo "autorestart=true" >> /etc/supervisord.d/supervisord.conf
+
+# Startup script
+RUN echo '#!/bin/bash' > /startup.sh && \
+    echo 'mkdir -p $HOME/.vnc $HOME/run $HOME/logs' >> /startup.sh && \
+    echo 'touch $HOME/.vnc/passwd && chmod 600 $HOME/.vnc/passwd' >> /startup.sh && \
+    echo 'exec /usr/bin/supervisord -c /etc/supervisord.d/supervisord.conf' >> /startup.sh && \
+    chmod +x /startup.sh
+
+# Set permissions
+RUN chown -R jmeter:jmeter /opt /home/jmeter /startup.sh
+
+EXPOSE 6080 5901
+WORKDIR /home/jmeter
+USER jmeter
+ENTRYPOINT ["/startup.sh"]
